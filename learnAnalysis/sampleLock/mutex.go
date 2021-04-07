@@ -8,8 +8,8 @@ type ProtectResource struct {
 }
 
 func (r *ProtectResource) GetResource() string {
-	defer r.mutex.Unlock()
-	r.mutex.Lock()
+	defer r.mutex.RUnlock()
+	r.mutex.RLock()
 	return r.resource
 }
 
@@ -17,14 +17,14 @@ type Mutex struct {
 	isLocked bool
 }
 
-func (m *Mutex) Lock() bool {
+func (m *Mutex) RLock() bool {
 	fmt.Println("Locking")
 	var old bool
 	m.isLocked, old = true, m.isLocked
 	return old // returns true if we are now deadlocked.
 }
 
-func (m *Mutex) Unlock() {
+func (m *Mutex) RUnlock() {
 	fmt.Println("Unlocking")
 	m.isLocked = false
 }
