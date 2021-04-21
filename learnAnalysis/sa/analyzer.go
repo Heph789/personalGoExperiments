@@ -1,5 +1,8 @@
 package sa
 
+// IMPORTANT NOTE: DEFERRED FUNCTION IS EXECUTED RIGHT AFTER RETURN STATEMENT.
+// NOT AFTER FUNCTION CALL IN RETURN STATEMENT
+
 import (
 	"errors"
 	"fmt"
@@ -24,6 +27,9 @@ var Analyzer = &analysis.Analyzer{
 
 var errNestedRLock = errors.New("found recursive read lock call")
 
+var funcToTest = "saveStateByRoot"
+var currentFunc = ""
+
 func run(pass *analysis.Pass) (interface{}, error) {
 	inspect, ok := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 	if !ok {
@@ -35,6 +41,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		(*ast.CallExpr)(nil),
 		(*ast.DeferStmt)(nil),
 		(*ast.FuncDecl)(nil),
+		(*ast.File)(nil),
 	}
 
 	foundRLock := 0
@@ -63,7 +70,8 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			} else if name == "RUnlock" && !deferredRLock {
 				foundRLock--
 			} else if name != "RUnlock" && foundRLock > 0 {
-				// fmt.Printf("Found '%v' at %v\n", name, pass.Fset.Position(node.Pos()))
+				//fmt.Printf("METHOD Found '%v' at %v\n", name, pass.Fset.Position(node.Pos()))
+				currentFunc = name
 				if stack := hasNestedRLock(name, inspect, pass.Fset); stack != "" {
 					pass.Reportf(
 						node.Pos(),
@@ -82,6 +90,8 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			}
 		case *ast.FuncDecl:
 			endPos = stmt.Body.Rbrace
+		case *ast.File:
+			//fmt.Printf("PACKAGE Found '%v' at %v\n", stmt.Name.Name, pass.Fset.Position(stmt.Name.NamePos))
 		}
 	})
 
@@ -108,6 +118,9 @@ func hasNestedRLock(funcName string, inspect *inspector.Inspector, f *token.File
 		case *ast.CallExpr:
 			name := getName(stmt.Fun)
 			addition := fmt.Sprintf("\tat %v\n", f.Position(iNode.Pos()))
+			if funcToTest == currentFunc {
+				fmt.Println(addition)
+			}
 			if name == "RLock" { // if the method found is an RLock method
 				retStack += addition
 			} else if name != "RUnlock" && name != funcName { // name should not equal the previousName to prevent infinite recursive loop
@@ -152,3 +165,7 @@ look through tree until we find
 	findCallDeclarationNode(name):
 inspect ast until we find a call declaration of name <name>
 */
+
+/*
+
+ */
