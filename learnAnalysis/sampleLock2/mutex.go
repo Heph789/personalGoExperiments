@@ -22,3 +22,8 @@ type NotProtected struct {
 func (r *NotProtected) GetResource() string {
 	return r.resource
 }
+
+type NestedResource struct {
+	ProtectResource
+	n *NotProtected
+}

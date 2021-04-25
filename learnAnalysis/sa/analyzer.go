@@ -11,24 +11,23 @@ import (
 
 	"go/ast"
 	"go/token"
+	"go/types"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
+	"golang.org/x/tools/go/types/typeutil"
 )
 
 // Analyzer runs static analysis.
 var Analyzer = &analysis.Analyzer{
 	Name:     "experiment",
-	Doc:      "Checks to see how AST is structured",
+	Doc:      "Checks for recursive or nested RLock calls",
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
 	Run:      run,
 }
 
 var errNestedRLock = errors.New("found recursive read lock call")
-
-var funcToTest = "saveStateByRoot"
-var currentFunc = ""
 
 func run(pass *analysis.Pass) (interface{}, error) {
 	inspect, ok := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
@@ -42,19 +41,24 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		(*ast.DeferStmt)(nil),
 		(*ast.FuncDecl)(nil),
 		(*ast.File)(nil),
+		(*ast.ReturnStmt)(nil),
 	}
 
 	foundRLock := 0
 	deferredRLock := false
 	endPos := token.NoPos
 	inspect.Preorder(nodeFilter, func(node ast.Node) {
-		if node.Pos() > endPos && deferredRLock {
+		if _, isRet := node.(*ast.ReturnStmt); deferredRLock && (node.Pos() > endPos || isRet) {
 			deferredRLock = false
 			foundRLock--
 		}
 		switch stmt := node.(type) {
 		case *ast.CallExpr:
-			name := getName(stmt.Fun)
+			call := getCallInfo(pass.TypesInfo, stmt)
+			if call == nil {
+				break
+			}
+			name := call.id
 			if name == "RLock" { // if the method found is an RLock method
 				if foundRLock > 0 { // if we have already seen an RLock method without seeing a corresponding RUnlock
 					// fmt.Println("Found RLock")
@@ -70,104 +74,97 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			} else if name == "RUnlock" && !deferredRLock {
 				foundRLock--
 			} else if name != "RUnlock" && foundRLock > 0 {
-				t := ""
-				if fun, ok := stmt.Fun.(*ast.SelectorExpr); ok {
-					t = getXType(fun)
+				// fmt.Printf("METHOD Found '%v' of type '%v' at %v\n", name, t, pass.Fset.Position(node.Pos()))
+				// ast.Print(pass.Fset, findCallDeclarationNode(getName(stmt.Fun), t, inspect))
+				if stack := hasNestedRLock(call, inspect, pass, make(map[string]bool)); stack != "" {
+					pass.Reportf(
+						node.Pos(),
+						fmt.Sprintf(
+							"%v\n%v",
+							errNestedRLock,
+							stack,
+						),
+					)
 				}
-				fmt.Printf("METHOD Found '%v' of type '%v' at %v\n", name, t, pass.Fset.Position(node.Pos()))
-				ast.Print(pass.Fset, findCallDeclarationNode(getName(stmt.Fun), t, inspect))
-				currentFunc = name
-				// funcType := getType(stmt.Fun)
-				// if stack := hasNestedRLock(name, funcType, inspect, pass.Fset); stack != "" {
-				// 	pass.Reportf(
-				// 		node.Pos(),
-				// 		fmt.Sprintf(
-				// 			"%v",
-				// 			errNestedRLock,
-				// 			// stack,
-				// 		),
-				// 	)
-				// }
 			}
 		case *ast.DeferStmt:
-			name := getName(stmt.Call.Fun)
-			if name == "RUnlock" {
+			call := getCallInfo(pass.TypesInfo, stmt.Call)
+			if call != nil && call.id == "RUnlock" {
 				deferredRLock = true
 			}
 		case *ast.FuncDecl:
-			// if stmt.Name.Name == "GetResource" {
-			// 	ast.Print(pass.Fset, stmt)
-			// }
 			endPos = stmt.End()
-		case *ast.File:
-			//fmt.Printf("PACKAGE Found '%v' at %v\n", stmt.Name.Name, pass.Fset.Position(stmt.Name.NamePos))
 		}
 	})
 
 	return nil, nil
 }
 
-func getNameAndType(fun ast.Expr) (string, string) {
-	switch expr := fun.(type) {
-	case *ast.SelectorExpr:
-		return expr.Sel.Name, getXType(expr)
-	case *ast.Ident:
-		return expr.Name, ""
-	}
-	return "", ""
+type callInfo struct {
+	id  string     // type ID [either the name (if the function is exported) or the package/name if otherwise] of the function/method
+	typ types.Type // type of the method receiver (nil if a function)
 }
 
-// for a selector expression like "X.Sel", get the type of X. If not a slector expression, return with empty string
-func getXType(expr *ast.SelectorExpr) string {
-	var i *ast.Ident
-	switch e := expr.X.(type) {
-	case *ast.SelectorExpr:
-		i = e.Sel
-	case *ast.Ident:
-		i = e
-	}
-	if i != nil {
-		switch dec := i.Obj.Decl.(type) {
-		case *ast.ValueSpec:
-			return getName(dec.Type)
-		case *ast.Field:
-			return getName(dec.Type)
-		}
-	}
-	return ""
+// returns true if callInfo represents a method, false if it is a function
+func (c *callInfo) isMethod() bool {
+	return c.typ != nil
 }
 
-func getName(e ast.Expr) string {
-	var name string
-	ast.Inspect(e, func(n ast.Node) bool {
-		if i, ok := n.(*ast.Ident); ok {
-			name = i.Name
-			return false
-		}
-		return true
-	})
-	return name
+func (c *callInfo) String() string {
+	if c.isMethod() {
+		return fmt.Sprintf("%v: %v", c.id, c.typ.String())
+	}
+	return c.id
 }
 
-func hasNestedRLock(funcName string, ofType string, inspect *inspector.Inspector, f *token.FileSet) (retStack string) {
-	node := findCallDeclarationNode(funcName, ofType, inspect)
+// returns a *callInfo struct with call info (ID and type)
+func getCallInfo(tInfo *types.Info, call *ast.CallExpr) (c *callInfo) {
+	c = &callInfo{}
+	f := typeutil.StaticCallee(tInfo, call)
+	if f == nil {
+		return nil
+	}
+	c.id = f.Id()
+	s, ok := f.Type().(*types.Signature)
+	if r := s.Recv(); ok && r != nil {
+		c.typ = r.Type()
+	}
+	return c
+}
+
+// hasNestedRLock takes a call expression represented by callInfo as input and returns a stack trace of the nested or recursive RLock within
+// that call expression. If the call expression does not contain a nested or recursive RLock, hasNestedRLock returns an empty string.
+// hasNestedRLock finds a nested or recursive RLock by recursively calling itself on any functions called by the function/method represented
+// by callInfo.
+func hasNestedRLock(call *callInfo, inspect *inspector.Inspector, pass *analysis.Pass, hist map[string]bool) (retStack string) {
+	f := pass.Fset
+	tInfo := pass.TypesInfo
+	node := findCallDeclarationNode(call, inspect, pass.TypesInfo)
 	if node == nil {
 		return ""
 	}
+	addition := fmt.Sprintf("\t%q at %v\n", call.id, f.Position(node.Pos()))
 	ast.Inspect(node, func(iNode ast.Node) bool {
 		switch stmt := iNode.(type) {
 		case *ast.CallExpr:
-			name := getName(stmt.Fun)
-			addition := fmt.Sprintf("\tat %v\n", f.Position(iNode.Pos()))
-			if funcToTest == currentFunc {
-				fmt.Println(addition)
+			c := getCallInfo(tInfo, stmt)
+			if c == nil {
+				return false
 			}
+			name := c.id
+
 			if name == "RLock" { // if the method found is an RLock method
-				retStack += addition
-			} else if name != "RUnlock" && name != funcName { // name should not equal the previousName to prevent infinite recursive loop
-				stack := hasNestedRLock(name, ofType, inspect, f)
-				if stack != "" {
-					retStack += addition + stack
+				retStack += addition + fmt.Sprintf("\t%q at %v\n", name, f.Position(iNode.Pos()))
+			} else if name != "RUnlock" { // name should not equal the previousName to prevent infinite recursive loop
+				// fmt.Printf("Type: %v\n", t)
+				nt := c.String()
+				if !hist[nt] { // make sure we are not in an infinite recursive loop
+					hist[nt] = true
+					stack := hasNestedRLock(c, inspect, pass, hist)
+					delete(hist, nt)
+					if stack != "" {
+						retStack += addition + stack
+					}
 				}
 			}
 		}
@@ -176,24 +173,29 @@ func hasNestedRLock(funcName string, ofType string, inspect *inspector.Inspector
 	return retStack
 }
 
-func findCallDeclarationNode(targetName string, targetType string, inspect *inspector.Inspector) ast.Node {
-	var retNode ast.Node = nil
+// findCallDeclarationNode takes a callInfo struct and inspects the AST of the package
+// to find a matching method or function declaration. It returns this declaration of type *ast.FuncDecl
+func findCallDeclarationNode(c *callInfo, inspect *inspector.Inspector, tInfo *types.Info) *ast.FuncDecl {
+	var retNode *ast.FuncDecl = nil
 	nodeFilter := []ast.Node{
 		(*ast.FuncDecl)(nil),
 	}
 	inspect.Preorder(nodeFilter, func(node ast.Node) {
 		funcDec, _ := node.(*ast.FuncDecl)
-		name := funcDec.Name.Name
-		if targetType != "" { // are we looking for a method of a specific type?
+		name := tInfo.ObjectOf(funcDec.Name).Id()
+		if c.isMethod() { // are we looking for a method of a specific type?
 			if funcDec.Recv == nil { // if this particular call declaration isn't even a method, we can move on
 				return
 			}
-			if targetType != getName(funcDec.Recv.List[0].Type) { // if the found type does not equal the target type, we can move on
+			if t := tInfo.TypeOf(funcDec.Recv.List[0].Type); !types.Identical(t, c.typ) { // if the found type does not equal the target type, we can move on
+				// fmt.Printf("Found call declaration of type %v\n", t)
 				return
 			}
+		} else if funcDec.Recv != nil { // if we are looking for a function, ignore methods
+			return
 		}
-		if targetName == name {
-			retNode = node
+		if c.id == name {
+			retNode = funcDec
 		}
 	})
 	return retNode
