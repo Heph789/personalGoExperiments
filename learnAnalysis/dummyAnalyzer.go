@@ -33,7 +33,7 @@ var funcToTest = "saveStateByRoot"
 var currentFunc = ""
 
 func run(pass *analysis.Pass) (interface{}, error) {
-	return run3(pass)
+	return run5(pass)
 }
 
 func run1(pass *analysis.Pass) (interface{}, error) {
@@ -123,6 +123,87 @@ func run4(pass *analysis.Pass) (interface{}, error) {
 
 	})
 	return nil, nil
+}
+
+func run5(pass *analysis.Pass) (interface{}, error) {
+	inspect, ok := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+	if !ok {
+		return nil, errors.New("analyzer is not type *inspector.Inspector")
+	}
+
+	// filters out other pieces of source code except for function/method calls
+	nodeFilter := []ast.Node{
+		(*ast.CallExpr)(nil),
+	}
+	inspect.Preorder(nodeFilter, func(node ast.Node) {
+		expr, ok := node.(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		// callH := callHelper{
+		// 	call: expr,
+		// }
+		// ast.Print(pass.Fset, callH.identifyFuncLitBlock(expr.Fun))
+		ast.Print(pass.Fset, expr)
+	})
+	return nil, nil
+}
+
+type callHelper struct {
+	call *ast.CallExpr
+}
+
+func (c callHelper) identifyFuncLitBlock(expr ast.Expr) *ast.BlockStmt {
+	switch stmt := expr.(type) {
+	case *ast.FuncLit:
+		return stmt.Body
+	case *ast.CallExpr:
+		return nil
+	case *ast.Ident:
+		if stmt.Obj != nil {
+			switch objDecl := stmt.Obj.Decl.(type) {
+			case *ast.ValueSpec:
+				value := objDecl.Values[findIdentIndex(stmt, objDecl.Names)]
+				return c.identifyFuncLitBlock(value)
+			case *ast.AssignStmt:
+				value := objDecl.Rhs[findExprIndex(c.call.Fun, objDecl.Lhs)]
+				return c.identifyFuncLitBlock(value)
+			}
+		}
+	}
+	return nil
+}
+
+func findIdentIndex(id *ast.Ident, exprs []*ast.Ident) int {
+	for i, v := range exprs {
+		if v.Name == id.Name {
+			return i
+		}
+	}
+	return -1
+}
+
+func findExprIndex(expr ast.Expr, exprs []ast.Expr) int {
+	switch stmt := expr.(type) {
+	case *ast.Ident:
+		return findIdentIndexFromExpr(stmt, exprs)
+	case *ast.SelectorExpr:
+		return findSelectorIndex(stmt, exprs)
+	}
+	return -1
+}
+
+func findIdentIndexFromExpr(id *ast.Ident, exprs []ast.Expr) int {
+	for i, v := range exprs {
+		if val, ok := v.(*ast.Ident); ok && val.Name == id.Name {
+			return i
+		}
+	}
+	return -1
+}
+
+func findSelectorIndex(expr ast.Expr, exprs []ast.Expr) int {
+	return 0 // a place holder for later
 }
 
 type callInfo struct {

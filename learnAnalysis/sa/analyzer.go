@@ -29,6 +29,8 @@ var Analyzer = &analysis.Analyzer{
 
 var errNestedRLock = errors.New("found recursive read lock call")
 
+var alreadyPrinted bool = false
+
 func run(pass *analysis.Pass) (interface{}, error) {
 	inspect, ok := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 	if !ok {
@@ -46,18 +48,55 @@ func run(pass *analysis.Pass) (interface{}, error) {
 
 	foundRLock := 0
 	deferredRLock := false
-	endPos := token.NoPos
+	funcEnd := token.NoPos
+	retEnd := token.NoPos
 	inspect.Preorder(nodeFilter, func(node ast.Node) {
-		if _, isRet := node.(*ast.ReturnStmt); deferredRLock && (node.Pos() > endPos || isRet) {
-			deferredRLock = false
-			foundRLock--
+		if retEnd.IsValid() && node.Pos() > retEnd { // if we are in a return statement
+			// lineNumber := pass.Fset.File(node.Pos()).Line(node.Pos())
+			// if lineNumber > 153 && lineNumber < 175 {
+			// 	fmt.Printf("finding RLock in retEnd.isValid\n")
+			// }
+			foundRLock++
+			retEnd = token.NoPos
+			deferredRLock = true
+		}
+		if funcEnd.IsValid() && node.Pos() > funcEnd { // if we are past the function, then the deferred RUnlock has been called
+			if deferredRLock {
+				deferredRLock = false
+				foundRLock--
+			}
+			funcEnd = token.NoPos
 		}
 		switch stmt := node.(type) {
 		case *ast.CallExpr:
 			call := getCallInfo(pass.TypesInfo, stmt)
-			if call == nil {
-				break
+			lineNumber := pass.Fset.File(node.Pos()).Line(node.Pos())
+			if lineNumber == 553 && pass.Fset.File(node.Pos()).Name() == "/mnt/e/Development/Ethereum+Truffle/prysm/beacon-chain/p2p/peers/status.go" && !alreadyPrinted {
+				// name := "N/A"
+				// if call != nil {
+				// 	name = call.id
+				// }
+				// fmt.Printf("Name: %v; foundRLock: %v; deferredRLock: %v; Position: %v; retEnd: %v; Number pos: %v\n", name, foundRLock, deferredRLock, pass.Fset.Position(stmt.Pos()), retEnd, stmt.Pos())
+				ast.Print(pass.Fset, node)
+				alreadyPrinted = true
 			}
+			// if 532 < lineNumber && lineNumber < 560 && pass.Fset.File(node.Pos()).Name() == "/mnt/e/Development/Ethereum+Truffle/prysm/beacon-chain/p2p/peers/status.go" && call != nil {
+			// 	// call2 := typeutil.Callee(pass.TypesInfo, stmt)
+			// 	// _, ok := call2.Type().(*types.Signature)
+			// 	// // if ok {
+			// 	// // 	_, ok2 := theVar.Type().(*types.Signature)
+			// 	// // 	fmt.Println(ok2)
+			// 	// // }
+			// 	// callString := types.ObjectString(call2, nil)
+			// 	// ast.Print(pass.Fset, stmt)
+			// 	fmt.Println(call.String())
+			// } else if call == nil {
+			// 	fmt.Println("nil")
+			// }
+			// if call == nil {
+			// 	break
+			// }
+			break
 			name := call.id
 			if name == "RLock" { // if the method found is an RLock method
 				if foundRLock > 0 { // if we have already seen an RLock method without seeing a corresponding RUnlock
@@ -70,6 +109,10 @@ func run(pass *analysis.Pass) (interface{}, error) {
 						),
 					)
 				}
+				// lineNumber := pass.Fset.File(stmt.Pos()).Line(stmt.Pos())
+				// if lineNumber > 153 && lineNumber < 175 {
+				// 	fmt.Printf("finding RLock in callExpr\n")
+				// }
 				foundRLock++
 			} else if name == "RUnlock" && !deferredRLock {
 				foundRLock--
@@ -92,8 +135,29 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			if call != nil && call.id == "RUnlock" {
 				deferredRLock = true
 			}
+			// lineNumber := pass.Fset.File(stmt.Pos()).Line(stmt.Pos())
+			// if lineNumber == 156 {
+			// 	fmt.Printf("We are deferring. Here is the value: %v\n", deferredRLock)
+			// }
 		case *ast.FuncDecl:
-			endPos = stmt.End()
+			lineNumber := pass.Fset.File(stmt.Pos()).Line(stmt.Pos())
+			if lineNumber > 532 && lineNumber < 559 {
+				// fmt.Printf("funcEnd: %v; newFuncEnd: %v; currentPos:%v\n", funcEnd, stmt.End(), stmt.Pos())
+				// fmt.Printf("Func name: %v\n", pass.TypesInfo.ObjectOf(stmt.Name).Id())
+			}
+			if funcEnd == token.NoPos {
+				funcEnd = stmt.End()
+			}
+		case *ast.ReturnStmt:
+			if deferredRLock { // only keep track of return end if RUnlock is deferred
+				deferredRLock = false
+				foundRLock--
+				retEnd = stmt.End()
+			}
+			// lineNumber := pass.Fset.File(stmt.Pos()).Line(stmt.Pos())
+			// if lineNumber == 159 || lineNumber == 161 {
+			// 	fmt.Printf("deferred: %v; foundRL: %v; retEnd:%v; pos:%v\n", deferredRLock, foundRLock, retEnd, stmt.Pos())
+			// }
 		}
 	})
 
@@ -120,16 +184,24 @@ func (c *callInfo) String() string {
 // returns a *callInfo struct with call info (ID and type)
 func getCallInfo(tInfo *types.Info, call *ast.CallExpr) (c *callInfo) {
 	c = &callInfo{}
-	f := typeutil.StaticCallee(tInfo, call)
+	f := typeutil.Callee(tInfo, call)
 	if f == nil {
 		return nil
 	}
-	c.id = f.Id()
 	s, ok := f.Type().(*types.Signature)
+	if _, isBuiltin := f.(*types.Builtin); isBuiltin || interfaceMethod(s) {
+		return nil
+	}
+	c.id = f.Id()
 	if r := s.Recv(); ok && r != nil {
 		c.typ = r.Type()
 	}
 	return c
+}
+
+func interfaceMethod(s *types.Signature) bool {
+	recv := s.Recv()
+	return recv != nil && types.IsInterface(recv.Type())
 }
 
 // hasNestedRLock takes a call expression represented by callInfo as input and returns a stack trace of the nested or recursive RLock within
@@ -226,4 +298,11 @@ Alright so what is happening is two-fold:
 Solution for 1:
 - Check types by looking at the Object field of the Selector Expression identifier
 - Keep this type in storage and match it when using the "findCallDeclarationNode" helper function
+*/
+
+// Plan for fixing multiple return statements bug:
+/*
+- Keep track of the end position of a return statement
+- Decrement foundRLock until the end position of return statement is reached
+- Reincrement foundRLock
 */
