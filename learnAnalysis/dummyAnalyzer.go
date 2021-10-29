@@ -136,15 +136,18 @@ func run5(pass *analysis.Pass) (interface{}, error) {
 		(*ast.CallExpr)(nil),
 	}
 	inspect.Preorder(nodeFilter, func(node ast.Node) {
+		lineNumber := pass.Fset.File(node.Pos()).Line(node.Pos())
 		expr, ok := node.(*ast.CallExpr)
 		if !ok {
 			return
 		}
-		// callH := callHelper{
-		// 	call: expr,
-		// }
-		// ast.Print(pass.Fset, callH.identifyFuncLitBlock(expr.Fun))
-		ast.Print(pass.Fset, expr)
+		callH := callHelper{
+			call: expr,
+		}
+		if lineNumber > 564 && lineNumber < 566 {
+			ast.Print(pass.Fset, callH.identifyFuncLitBlock(expr.Fun))
+			ast.Print(pass.Fset, expr)
+		}
 	})
 	return nil, nil
 }

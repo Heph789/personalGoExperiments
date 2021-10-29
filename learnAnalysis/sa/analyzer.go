@@ -29,7 +29,7 @@ var Analyzer = &analysis.Analyzer{
 
 var errNestedRLock = errors.New("found recursive read lock call")
 
-var alreadyPrinted bool = false
+var once bool = true
 
 func run(pass *analysis.Pass) (interface{}, error) {
 	inspect, ok := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
@@ -42,6 +42,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		(*ast.CallExpr)(nil),
 		(*ast.DeferStmt)(nil),
 		(*ast.FuncDecl)(nil),
+		(*ast.FuncLit)(nil),
 		(*ast.File)(nil),
 		(*ast.ReturnStmt)(nil),
 	}
@@ -50,12 +51,18 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	deferredRLock := false
 	funcEnd := token.NoPos
 	retEnd := token.NoPos
+	funcLitEnd := token.NoPos
 	inspect.Preorder(nodeFilter, func(node ast.Node) {
+		lineNumber := pass.Fset.File(node.Pos()).Position(node.Pos())
+		once = true
+		prevFoundRLock := foundRLock
+		prevDeferredRL := deferredRLock
+		if funcLitEnd.IsValid() && node.Pos() <= funcLitEnd {
+			return
+		} else {
+			funcLitEnd = token.NoPos
+		}
 		if retEnd.IsValid() && node.Pos() > retEnd { // if we are in a return statement
-			// lineNumber := pass.Fset.File(node.Pos()).Line(node.Pos())
-			// if lineNumber > 153 && lineNumber < 175 {
-			// 	fmt.Printf("finding RLock in retEnd.isValid\n")
-			// }
 			foundRLock++
 			retEnd = token.NoPos
 			deferredRLock = true
@@ -67,67 +74,45 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			}
 			funcEnd = token.NoPos
 		}
+		if foundRLock != prevFoundRLock {
+			fmt.Printf("%v\nPrevRL:%v;CurrentRL:%v\n", lineNumber, prevFoundRLock, foundRLock)
+			fmt.Printf("PrevD:%v;D:%v\n", prevDeferredRL, deferredRLock)
+		}
 		switch stmt := node.(type) {
 		case *ast.CallExpr:
+			// fmt.Println(lineNumber)
 			call := getCallInfo(pass.TypesInfo, stmt)
-			lineNumber := pass.Fset.File(node.Pos()).Line(node.Pos())
-			if lineNumber == 553 && pass.Fset.File(node.Pos()).Name() == "/mnt/e/Development/Ethereum+Truffle/prysm/beacon-chain/p2p/peers/status.go" && !alreadyPrinted {
-				// name := "N/A"
-				// if call != nil {
-				// 	name = call.id
-				// }
-				// fmt.Printf("Name: %v; foundRLock: %v; deferredRLock: %v; Position: %v; retEnd: %v; Number pos: %v\n", name, foundRLock, deferredRLock, pass.Fset.Position(stmt.Pos()), retEnd, stmt.Pos())
-				ast.Print(pass.Fset, node)
-				alreadyPrinted = true
+			// if lineNumber > 547 && lineNumber < 549 {
+			// 	ast.Print(pass.Fset, node)
+			// }
+			if call == nil {
+				break
 			}
-			// if 532 < lineNumber && lineNumber < 560 && pass.Fset.File(node.Pos()).Name() == "/mnt/e/Development/Ethereum+Truffle/prysm/beacon-chain/p2p/peers/status.go" && call != nil {
-			// 	// call2 := typeutil.Callee(pass.TypesInfo, stmt)
-			// 	// _, ok := call2.Type().(*types.Signature)
-			// 	// // if ok {
-			// 	// // 	_, ok2 := theVar.Type().(*types.Signature)
-			// 	// // 	fmt.Println(ok2)
-			// 	// // }
-			// 	// callString := types.ObjectString(call2, nil)
-			// 	// ast.Print(pass.Fset, stmt)
-			// 	fmt.Println(call.String())
-			// } else if call == nil {
-			// 	fmt.Println("nil")
-			// }
-			// if call == nil {
-			// 	break
-			// }
-			break
 			name := call.id
 			if name == "RLock" { // if the method found is an RLock method
 				if foundRLock > 0 { // if we have already seen an RLock method without seeing a corresponding RUnlock
-					// fmt.Println("Found RLock")
-					pass.Reportf(
-						node.Pos(),
-						fmt.Sprintf(
-							"%v",
-							errNestedRLock,
-						),
-					)
+					// pass.Reportf(
+					// 	node.Pos(),
+					// 	fmt.Sprintf(
+					// 		"%v",
+					// 		errNestedRLock,
+					// 	),
+					// )
 				}
-				// lineNumber := pass.Fset.File(stmt.Pos()).Line(stmt.Pos())
-				// if lineNumber > 153 && lineNumber < 175 {
-				// 	fmt.Printf("finding RLock in callExpr\n")
-				// }
+				fmt.Printf("Incrementing FoundRLock from %v to %v\n", foundRLock, foundRLock+1)
 				foundRLock++
 			} else if name == "RUnlock" && !deferredRLock {
 				foundRLock--
 			} else if name != "RUnlock" && foundRLock > 0 {
-				// fmt.Printf("METHOD Found '%v' of type '%v' at %v\n", name, t, pass.Fset.Position(node.Pos()))
-				// ast.Print(pass.Fset, findCallDeclarationNode(getName(stmt.Fun), t, inspect))
 				if stack := hasNestedRLock(call, inspect, pass, make(map[string]bool)); stack != "" {
-					pass.Reportf(
-						node.Pos(),
-						fmt.Sprintf(
-							"%v\n%v",
-							errNestedRLock,
-							stack,
-						),
-					)
+					// pass.Reportf(
+					// 	node.Pos(),
+					// 	fmt.Sprintf(
+					// 		"%v\n%v",
+					// 		errNestedRLock,
+					// 		stack,
+					// 	),
+					// )
 				}
 			}
 		case *ast.DeferStmt:
@@ -135,18 +120,14 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			if call != nil && call.id == "RUnlock" {
 				deferredRLock = true
 			}
-			// lineNumber := pass.Fset.File(stmt.Pos()).Line(stmt.Pos())
-			// if lineNumber == 156 {
-			// 	fmt.Printf("We are deferring. Here is the value: %v\n", deferredRLock)
-			// }
 		case *ast.FuncDecl:
-			lineNumber := pass.Fset.File(stmt.Pos()).Line(stmt.Pos())
-			if lineNumber > 532 && lineNumber < 559 {
-				// fmt.Printf("funcEnd: %v; newFuncEnd: %v; currentPos:%v\n", funcEnd, stmt.End(), stmt.Pos())
-				// fmt.Printf("Func name: %v\n", pass.TypesInfo.ObjectOf(stmt.Name).Id())
-			}
 			if funcEnd == token.NoPos {
+				// foundRLock = 0
 				funcEnd = stmt.End()
+			}
+		case *ast.FuncLit:
+			if funcLitEnd == token.NoPos {
+				funcLitEnd = stmt.End()
 			}
 		case *ast.ReturnStmt:
 			if deferredRLock { // only keep track of return end if RUnlock is deferred
@@ -154,19 +135,15 @@ func run(pass *analysis.Pass) (interface{}, error) {
 				foundRLock--
 				retEnd = stmt.End()
 			}
-			// lineNumber := pass.Fset.File(stmt.Pos()).Line(stmt.Pos())
-			// if lineNumber == 159 || lineNumber == 161 {
-			// 	fmt.Printf("deferred: %v; foundRL: %v; retEnd:%v; pos:%v\n", deferredRLock, foundRLock, retEnd, stmt.Pos())
-			// }
 		}
 	})
-
 	return nil, nil
 }
 
 type callInfo struct {
-	id  string     // type ID [either the name (if the function is exported) or the package/name if otherwise] of the function/method
-	typ types.Type // type of the method receiver (nil if a function)
+	call *ast.CallExpr
+	id   string     // type ID [either the name (if the function is exported) or the package/name if otherwise] of the function/method
+	typ  types.Type // type of the method receiver (nil if a function)
 }
 
 // returns true if callInfo represents a method, false if it is a function
@@ -184,18 +161,24 @@ func (c *callInfo) String() string {
 // returns a *callInfo struct with call info (ID and type)
 func getCallInfo(tInfo *types.Info, call *ast.CallExpr) (c *callInfo) {
 	c = &callInfo{}
+	c.call = call
 	f := typeutil.Callee(tInfo, call)
 	if f == nil {
 		return nil
 	}
-	s, ok := f.Type().(*types.Signature)
-	if _, isBuiltin := f.(*types.Builtin); isBuiltin || interfaceMethod(s) {
+	if _, isBuiltin := f.(*types.Builtin); isBuiltin {
 		return nil
 	}
-	c.id = f.Id()
-	if r := s.Recv(); ok && r != nil {
-		c.typ = r.Type()
+	s, ok := f.Type().(*types.Signature)
+	if ok {
+		if interfaceMethod(s) {
+			return nil
+		}
+		if r := s.Recv(); r != nil {
+			c.typ = r.Type()
+		}
 	}
+	c.id = f.Id()
 	return c
 }
 
@@ -211,11 +194,18 @@ func interfaceMethod(s *types.Signature) bool {
 func hasNestedRLock(call *callInfo, inspect *inspector.Inspector, pass *analysis.Pass, hist map[string]bool) (retStack string) {
 	f := pass.Fset
 	tInfo := pass.TypesInfo
-	node := findCallDeclarationNode(call, inspect, pass.TypesInfo)
-	if node == nil {
+	cH := callHelper{
+		call: call.call,
+		fset: pass.Fset,
+	}
+	var node ast.Node = cH.identifyFuncLitBlock(call.call.Fun)
+	if node == (*ast.BlockStmt)(nil) {
+		node = findCallDeclarationNode(call, inspect, pass.TypesInfo)
+	}
+	if node == (*ast.FuncDecl)(nil) {
 		return ""
 	}
-	addition := fmt.Sprintf("\t%q at %v\n", call.id, f.Position(node.Pos()))
+	addition := fmt.Sprintf("\t%q at %v\n", call.id, f.Position(call.call.Pos()))
 	ast.Inspect(node, func(iNode ast.Node) bool {
 		switch stmt := iNode.(type) {
 		case *ast.CallExpr:
@@ -228,7 +218,6 @@ func hasNestedRLock(call *callInfo, inspect *inspector.Inspector, pass *analysis
 			if name == "RLock" { // if the method found is an RLock method
 				retStack += addition + fmt.Sprintf("\t%q at %v\n", name, f.Position(iNode.Pos()))
 			} else if name != "RUnlock" { // name should not equal the previousName to prevent infinite recursive loop
-				// fmt.Printf("Type: %v\n", t)
 				nt := c.String()
 				if !hist[nt] { // make sure we are not in an infinite recursive loop
 					hist[nt] = true
@@ -271,6 +260,74 @@ func findCallDeclarationNode(c *callInfo, inspect *inspector.Inspector, tInfo *t
 		}
 	})
 	return retNode
+}
+
+type callHelper struct {
+	call *ast.CallExpr
+	fset *token.FileSet
+}
+
+func (c callHelper) identifyFuncLitBlock(expr ast.Expr) *ast.BlockStmt {
+	switch stmt := expr.(type) {
+	case *ast.FuncLit:
+		return stmt.Body
+	case *ast.CallExpr:
+		return nil
+	case *ast.Ident:
+		if stmt.Obj != nil {
+			switch objDecl := stmt.Obj.Decl.(type) {
+			case *ast.ValueSpec:
+				identIndex := findIdentIndex(stmt, objDecl.Names)
+				if identIndex != -1 {
+					value := objDecl.Values[identIndex]
+					return c.identifyFuncLitBlock(value)
+				}
+			case *ast.AssignStmt:
+				exprIndex := findExprIndex(c.call.Fun, objDecl.Lhs)
+				if exprIndex != -1 && len(objDecl.Lhs) == len(objDecl.Rhs) { // only deals with simple func lit assignments
+					value := objDecl.Rhs[exprIndex]
+					return c.identifyFuncLitBlock(value)
+				}
+				// if exprIndex >= len(objDecl.Rhs) && once {
+				// 	ast.Print(c.fset, stmt)
+				// 	once = false
+				// }
+			}
+		}
+	}
+	return nil
+}
+
+func findIdentIndex(id *ast.Ident, exprs []*ast.Ident) int {
+	for i, v := range exprs {
+		if v.Name == id.Name {
+			return i
+		}
+	}
+	return -1
+}
+
+func findExprIndex(expr ast.Expr, exprs []ast.Expr) int {
+	switch stmt := expr.(type) {
+	case *ast.Ident:
+		return findIdentIndexFromExpr(stmt, exprs)
+	case *ast.SelectorExpr:
+		return findSelectorIndex(stmt, exprs)
+	}
+	return -1
+}
+
+func findIdentIndexFromExpr(id *ast.Ident, exprs []ast.Expr) int {
+	for i, v := range exprs {
+		if val, ok := v.(*ast.Ident); ok && val.Name == id.Name {
+			return i
+		}
+	}
+	return -1
+}
+
+func findSelectorIndex(expr ast.Expr, exprs []ast.Expr) int {
+	return 0 // a place holder for later
 }
 
 /*
