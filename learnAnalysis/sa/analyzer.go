@@ -47,97 +47,113 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		(*ast.ReturnStmt)(nil),
 	}
 
-	foundRLock := 0
-	deferredRLock := false
-	funcEnd := token.NoPos
-	retEnd := token.NoPos
-	funcLitEnd := token.NoPos
+	// debug := &debugHelper{
+	// 	pass: pass,
+	// }
+	var keepTrackOf tracker
 	inspect.Preorder(nodeFilter, func(node ast.Node) {
-		lineNumber := pass.Fset.File(node.Pos()).Position(node.Pos())
-		once = true
-		prevFoundRLock := foundRLock
-		prevDeferredRL := deferredRLock
-		if funcLitEnd.IsValid() && node.Pos() <= funcLitEnd {
+		if keepTrackOf.funcLitEnd.IsValid() && node.Pos() <= keepTrackOf.funcLitEnd {
 			return
 		} else {
-			funcLitEnd = token.NoPos
+			keepTrackOf.funcLitEnd = token.NoPos
 		}
-		if retEnd.IsValid() && node.Pos() > retEnd { // if we are in a return statement
-			foundRLock++
-			retEnd = token.NoPos
-			deferredRLock = true
-		}
-		if funcEnd.IsValid() && node.Pos() > funcEnd { // if we are past the function, then the deferred RUnlock has been called
-			if deferredRLock {
-				deferredRLock = false
-				foundRLock--
-			}
-			funcEnd = token.NoPos
-		}
-		if foundRLock != prevFoundRLock {
-			fmt.Printf("%v\nPrevRL:%v;CurrentRL:%v\n", lineNumber, prevFoundRLock, foundRLock)
-			fmt.Printf("PrevD:%v;D:%v\n", prevDeferredRL, deferredRLock)
-		}
+
 		switch stmt := node.(type) {
 		case *ast.CallExpr:
-			// fmt.Println(lineNumber)
 			call := getCallInfo(pass.TypesInfo, stmt)
-			// if lineNumber > 547 && lineNumber < 549 {
-			// 	ast.Print(pass.Fset, node)
-			// }
 			if call == nil {
 				break
 			}
 			name := call.id
 			if name == "RLock" { // if the method found is an RLock method
-				if foundRLock > 0 { // if we have already seen an RLock method without seeing a corresponding RUnlock
-					// pass.Reportf(
-					// 	node.Pos(),
-					// 	fmt.Sprintf(
-					// 		"%v",
-					// 		errNestedRLock,
-					// 	),
-					// )
+				if keepTrackOf.foundRLock > 0 { // if we have already seen an RLock method without seeing a corresponding RUnlock
+					pass.Reportf(
+						node.Pos(),
+						fmt.Sprintf(
+							"%v",
+							errNestedRLock,
+						),
+					)
 				}
-				fmt.Printf("Incrementing FoundRLock from %v to %v\n", foundRLock, foundRLock+1)
-				foundRLock++
-			} else if name == "RUnlock" && !deferredRLock {
-				foundRLock--
-			} else if name != "RUnlock" && foundRLock > 0 {
+				keepTrackOf.incFRU()
+			} else if name == "RUnlock" && !keepTrackOf.deferredRUnlock {
+				keepTrackOf.deincFRU()
+			} else if name != "RUnlock" && keepTrackOf.foundRLock > 0 {
 				if stack := hasNestedRLock(call, inspect, pass, make(map[string]bool)); stack != "" {
-					// pass.Reportf(
-					// 	node.Pos(),
-					// 	fmt.Sprintf(
-					// 		"%v\n%v",
-					// 		errNestedRLock,
-					// 		stack,
-					// 	),
-					// )
+					pass.Reportf(
+						node.Pos(),
+						fmt.Sprintf(
+							"%v\n%v",
+							errNestedRLock,
+							stack,
+						),
+					)
 				}
+			}
+		case *ast.File:
+			keepTrackOf = tracker{}
+		case *ast.FuncDecl:
+			keepTrackOf = tracker{}
+			keepTrackOf.funcEnd = stmt.End()
+		case *ast.FuncLit:
+			if keepTrackOf.funcLitEnd == token.NoPos {
+				keepTrackOf.funcLitEnd = stmt.End()
 			}
 		case *ast.DeferStmt:
 			call := getCallInfo(pass.TypesInfo, stmt.Call)
+			if keepTrackOf.deferEnd == token.NoPos {
+				keepTrackOf.deferEnd = stmt.End()
+			}
 			if call != nil && call.id == "RUnlock" {
-				deferredRLock = true
-			}
-		case *ast.FuncDecl:
-			if funcEnd == token.NoPos {
-				// foundRLock = 0
-				funcEnd = stmt.End()
-			}
-		case *ast.FuncLit:
-			if funcLitEnd == token.NoPos {
-				funcLitEnd = stmt.End()
+				keepTrackOf.deferredRUnlock = true
 			}
 		case *ast.ReturnStmt:
-			if deferredRLock { // only keep track of return end if RUnlock is deferred
-				deferredRLock = false
-				foundRLock--
-				retEnd = stmt.End()
+			if keepTrackOf.deferredRUnlock && keepTrackOf.retEnd == token.NoPos {
+				keepTrackOf.deincFRU()
+				keepTrackOf.retEnd = stmt.End()
 			}
 		}
 	})
 	return nil, nil
+}
+
+type tracker struct {
+	funcEnd         token.Pos
+	retEnd          token.Pos
+	deferEnd        token.Pos
+	funcLitEnd      token.Pos
+	deferredRUnlock bool
+	foundRLock      int
+}
+
+func (t tracker) toString() string {
+	return fmt.Sprintf("funcEnd:%v\nretEnd:%v\ndeferEnd:%v\ndeferredRU:%v\nfoundRLock:%v\n", t.funcEnd, t.retEnd, t.deferEnd, t.deferredRUnlock, t.foundRLock)
+}
+
+func (t *tracker) deincFRU() {
+	if t.foundRLock > 0 {
+		t.foundRLock -= 1
+	}
+}
+func (t *tracker) incFRU() {
+	t.foundRLock += 1
+}
+
+// debug functions and helpers
+type debugHelper struct {
+	pass *analysis.Pass
+}
+
+func (d *debugHelper) getPosition(node ast.Node) token.Position {
+	return d.pass.Fset.File(node.Pos()).Position(node.Pos())
+}
+
+func (d *debugHelper) log(node ast.Node, a int, b int, fileName string, format string, c ...interface{}) {
+	lineNumber := d.pass.Fset.File(node.Pos()).Line(node.Pos())
+	fName := d.pass.Fset.File(node.Pos()).Name()
+	if a <= lineNumber && lineNumber <= b && fName == fileName {
+		fmt.Printf(format, c...)
+	}
 }
 
 type callInfo struct {

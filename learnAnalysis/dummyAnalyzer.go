@@ -33,7 +33,7 @@ var funcToTest = "saveStateByRoot"
 var currentFunc = ""
 
 func run(pass *analysis.Pass) (interface{}, error) {
-	return run5(pass)
+	return run6(pass)
 }
 
 func run1(pass *analysis.Pass) (interface{}, error) {
@@ -152,6 +152,109 @@ func run5(pass *analysis.Pass) (interface{}, error) {
 	return nil, nil
 }
 
+func run6(pass *analysis.Pass) (interface{}, error) {
+	inspect, ok := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+	if !ok {
+		return nil, errors.New("analyzer is not type *inspector.Inspector")
+	}
+
+	// filters out other pieces of source code except for function/method calls
+	nodeFilter := []ast.Node{
+		(*ast.CallExpr)(nil),
+		(*ast.DeferStmt)(nil),
+		(*ast.FuncDecl)(nil),
+		(*ast.FuncLit)(nil),
+		(*ast.File)(nil),
+		(*ast.ReturnStmt)(nil),
+	}
+
+	debug := &debugHelper{
+		pass: pass,
+	}
+	var keepTrackOf tracker
+	inspect.Preorder(nodeFilter, func(node ast.Node) {
+		debug.log(node, 435, 458, "/Users/chase/Documents/dev/prysm/beacon-chain/p2p/peers/status.go", "%v\nnodePos:%v\n%v", debug.getPosition(node), node.Pos(), keepTrackOf.toString())
+		if keepTrackOf.deferEnd.IsValid() && node.Pos() > keepTrackOf.deferEnd {
+			keepTrackOf.deferEnd = token.NoPos
+		} else if keepTrackOf.deferEnd.IsValid() {
+			return
+		}
+		if keepTrackOf.retEnd.IsValid() && node.Pos() > keepTrackOf.retEnd {
+			keepTrackOf.retEnd = token.NoPos
+		}
+		switch stmt := node.(type) {
+		case *ast.CallExpr:
+			call := getCallInfo(pass.TypesInfo, stmt)
+			if call == nil {
+				break
+			}
+			name := call.id
+			if name == "RLock" {
+				keepTrackOf.foundRLock++
+			} else if name == "RUnlock" {
+				keepTrackOf.deincFRU()
+			}
+		case *ast.File:
+			keepTrackOf = tracker{}
+		case *ast.FuncDecl:
+			keepTrackOf = tracker{}
+			keepTrackOf.funcEnd = stmt.End()
+		case *ast.DeferStmt:
+			call := getCallInfo(pass.TypesInfo, stmt.Call)
+			if keepTrackOf.deferEnd == token.NoPos {
+				keepTrackOf.deferEnd = stmt.End()
+			}
+			if call != nil && call.id == "RUnlock" {
+				keepTrackOf.deferredRUnlock = true
+			}
+		case *ast.ReturnStmt:
+			if keepTrackOf.deferredRUnlock && keepTrackOf.retEnd == token.NoPos {
+				keepTrackOf.deincFRU()
+				keepTrackOf.retEnd = stmt.End()
+			}
+		}
+	})
+	return nil, nil
+}
+
+type tracker struct {
+	funcEnd         token.Pos
+	retEnd          token.Pos
+	deferEnd        token.Pos
+	deferredRUnlock bool
+	foundRLock      int
+}
+
+func (t tracker) toString() string {
+	return fmt.Sprintf("funcEnd:%v\nretEnd:%v\ndeferEnd:%v\ndeferredRU:%v\nfoundRLock:%v\n", t.funcEnd, t.retEnd, t.deferEnd, t.deferredRUnlock, t.foundRLock)
+}
+
+func (t *tracker) deincFRU() {
+	if t.foundRLock > 0 {
+		t.foundRLock -= 1
+	}
+}
+func (t *tracker) incFRU() {
+	t.foundRLock += 1
+}
+
+// debug functions and helpers
+type debugHelper struct {
+	pass *analysis.Pass
+}
+
+func (d *debugHelper) getPosition(node ast.Node) token.Position {
+	return d.pass.Fset.File(node.Pos()).Position(node.Pos())
+}
+
+func (d *debugHelper) log(node ast.Node, a int, b int, fileName string, format string, c ...interface{}) {
+	lineNumber := d.pass.Fset.File(node.Pos()).Line(node.Pos())
+	fName := d.pass.Fset.File(node.Pos()).Name()
+	if a <= lineNumber && lineNumber <= b && fName == fileName {
+		fmt.Printf(format, c...)
+	}
+}
+
 type callHelper struct {
 	call *ast.CallExpr
 }
@@ -210,8 +313,9 @@ func findSelectorIndex(expr ast.Expr, exprs []ast.Expr) int {
 }
 
 type callInfo struct {
-	id  string     // type ID [either the name (if the function is exported) or the package/name if otherwise] of the function/method
-	typ types.Type // type of the method receiver (nil if a function)
+	call *ast.CallExpr
+	id   string     // type ID [either the name (if the function is exported) or the package/name if otherwise] of the function/method
+	typ  types.Type // type of the method receiver (nil if a function)
 }
 
 // returns true if callInfo represents a method, false if it is a function
@@ -219,20 +323,40 @@ func (c *callInfo) isMethod() bool {
 	return c.typ != nil
 }
 
+func (c *callInfo) String() string {
+	if c.isMethod() {
+		return fmt.Sprintf("%v: %v", c.id, c.typ.String())
+	}
+	return c.id
+}
+
 // returns a *callInfo struct with call info (ID and type)
-func getCallInfo(tInfo *types.Info, call *ast.CallExpr) *callInfo {
-	var c *callInfo = &callInfo{}
-	f := typeutil.StaticCallee(tInfo, call)
+func getCallInfo(tInfo *types.Info, call *ast.CallExpr) (c *callInfo) {
+	c = &callInfo{}
+	c.call = call
+	f := typeutil.Callee(tInfo, call)
 	if f == nil {
 		return nil
 	}
-	fmt.Println(f)
-	c.id = "hello"
-	s, ok := f.Type().(*types.Signature)
-	if r := s.Recv(); ok && r != nil {
-		c.typ = r.Type()
+	if _, isBuiltin := f.(*types.Builtin); isBuiltin {
+		return nil
 	}
+	s, ok := f.Type().(*types.Signature)
+	if ok {
+		if interfaceMethod(s) {
+			return nil
+		}
+		if r := s.Recv(); r != nil {
+			c.typ = r.Type()
+		}
+	}
+	c.id = f.Id()
 	return c
+}
+
+func interfaceMethod(s *types.Signature) bool {
+	recv := s.Recv()
+	return recv != nil && types.IsInterface(recv.Type())
 }
 
 // func getNameAndType(fun ast.Expr) (string, string) {
