@@ -4,15 +4,18 @@ import "github.com/Heph789/personalGoExperiments/learnAnalysis/sampleLock2/iType
 
 var resource *ProtectResource = &ProtectResource{resource: "protected"}
 var a *iTypes.AwesomeProtectedResource
-var nested *NestedResource = &NestedResource{n: &NotProtected{resource: "hello"}}
+var nested *NestedResource = &NestedResource{
+	n:    &NotProtected{resource: "hello"},
+	nest: &NestedResource{n: &NotProtected{resource: "goodbye"}},
+}
 
 func DoSomething() {
-	resource.RLock()
-	a.SetResource("protected")
-	resource.GetResource() // should be giving warning but analyzer is looking at NotProtected.GetResource instead
-	nested.GetResource()
-	nested.n.GetResource()
-	resource.RUnlock()
+	nested.nest.RLock()
+	fun := func() {
+		nested.GetNestedResource()
+	}
+	fun()
+	nested.nest.RUnlock()
 }
 
 func AnotherWayToDoSomething(r *ProtectResource) {
